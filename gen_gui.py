@@ -734,9 +734,8 @@ def do_window_drag(event):
     root.geometry(f"+{event.x_root - drag_offset_x}+{event.y_root - drag_offset_y}")
 
 
-# --- Square-Locked Resizing Logic ---
+# Keeps it a square cause im too lazy to do resizing stuff
 def apply_window_size():
-    """Scales the square canvas, wizard art, orb position, and all UI widgets proportionally."""
     global PANEL_BOUNDS, ORB_CENTER_X, ORB_CENTER_Y, ORB_QR_SIZE, GLOW_PATCH_SIZE, PANEL_BASE_IMG, PULSE_FRAMES
 
     PANEL_BOUNDS = (sc(54), sc(18), sc(966), sc(334))
@@ -745,21 +744,18 @@ def apply_window_size():
     ORB_QR_SIZE = sc(290)
     GLOW_PATCH_SIZE = ORB_QR_SIZE + sc(120)
 
-    # 1. Update total window & canvas size
     root.geometry(f"{WIN_SIZE + 20}x{WIN_SIZE + TITLE_BAR_HEIGHT + 24}")
     canvas.config(width=WIN_SIZE, height=WIN_SIZE)
 
-    # 2. Update titlebar banner width
     banner_img = make_titlebar_banner(WIN_SIZE + 8, TITLE_BAR_HEIGHT - 4)
     title_banner_label.config(image=banner_img)
     title_banner_label.image = banner_img
+    controls_frame.lift()
 
-    # 3. Rebuild wizard background & pulse frames for new size
     wiz_resized = MASTER_WIZ_IMG.resize((WIN_SIZE, WIN_SIZE), Image.Resampling.NEAREST)
     PANEL_BASE_IMG = draw_old_english_pixel_panel(wiz_resized, PANEL_BOUNDS)
     PULSE_FRAMES = build_pulse_frames()
 
-    # 4. Reposition and scale all UI widgets proportionally
     url_entry.config(font=("Jacquarda Bastarda 9", max(9, sc(15))))
     canvas.coords(entry_win, sc(86), sc(68))
     canvas.itemconfig(entry_win, width=sc(848), height=sc(32))
@@ -887,8 +883,9 @@ title_banner_label.pack(fill="both", expand=True)
 title_banner_label.bind("<ButtonPress-1>", start_window_drag)
 title_banner_label.bind("<B1-Motion>", do_window_drag)
 
-controls_frame = tk.Frame(title_banner_label, bg=PURPLE_TITLE_RIGHT)
+controls_frame = tk.Frame(title_bar, bg=PURPLE_TITLE_RIGHT)
 controls_frame.place(relx=1.0, rely=0.5, x=-6, anchor="e")
+controls_frame.lift()
 
 min_icon = make_win95_control_button("min")
 close_icon = make_win95_control_button("close")
@@ -918,7 +915,6 @@ canvas.pack(fill="both", expand=True, padx=2, pady=(0, 2))
 bg_image_id = canvas.create_image(0, 0, anchor="nw")
 canvas.bind("<Button-1>", on_canvas_click)
 
-# UI Elements on Canvas (stored by ID so apply_window_size can scale them)
 url_entry = tk.Entry(
     root,
     bg=HEX_DARK,
