@@ -6,6 +6,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 import tempfile
 import urllib.request
 import tkinter as tk
@@ -22,8 +23,6 @@ from qrcode.image.styles.moduledrawers import (
     VerticalBarsDrawer,
 )
 
-import sys
-
 # Make sure correct run syst
 if getattr(sys, "frozen", False):
     SCRIPT_DIR = sys._MEIPASS
@@ -39,14 +38,30 @@ FONT_URL = (
 )
 FONT_PATH = os.path.join(SCRIPT_DIR, "JacquardaBastarda9-Regular.ttf")
 
-APP_TITLE = "QR Orb Pondering"
-WIN_SIZE = 1020
-PANEL_BOUNDS = (54, 18, 966, 334)
+# Base design size (all original coordinates are scaled relative to 1020)
+BASE_DESIGN_SIZE = 1020
+MIN_WIN_SIZE = 380
+MAX_WIN_SIZE = 1600
 
-# Where Orb (might need to adjust this if i change sizing)
-ORB_CENTER_X = int(WIN_SIZE * 0.488)  # 498 px
-ORB_CENTER_Y = int(WIN_SIZE * 0.812)  # 828 px (lowered from 0.775)
-ORB_QR_SIZE = 290
+# Actual app border stuff
+APP_TITLE = "Orb QR Pondering"
+TITLE_BAR_HEIGHT = 40
+
+PURPLE_FRAME_BG = "#2e164d"
+PURPLE_TITLE_BG = "#3d1e66"
+PURPLE_TITLE_RIGHT = "#220e3b"
+PURPLE_HILIGHT = "#7a52aa"
+PURPLE_LIGHT = "#53307e"
+PURPLE_SHADOW = "#180929"
+PURPLE_DARK_EDGE = "#0c0417"
+
+# Dynamic sizing globals (recalculated at startup based on screen height & on resize)
+WIN_SIZE = 540
+PANEL_BOUNDS = (54, 18, 966, 334)
+ORB_CENTER_X = int(WIN_SIZE * 0.488)
+ORB_CENTER_Y = int(WIN_SIZE * 0.812)
+ORB_QR_SIZE = int(WIN_SIZE * (290 / BASE_DESIGN_SIZE))
+GLOW_PATCH_SIZE = ORB_QR_SIZE + 120
 
 # Color stuff
 PALETTE_DARK = (3, 30, 46)
@@ -68,17 +83,29 @@ STYLE_MAP = {
     "Horizontal Bars": HorizontalBarsDrawer,
 }
 
-# Honestly not sure how this works, but its for animation stuff
+# Animation & UI state
 qr_color = "#031e2e"
 bg_color = "#ffffff"
 status_message = ""
 status_color = PALETTE_GOLD
 
+PANEL_BASE_IMG: Image.Image | None = None
+PULSE_FRAMES: list[Image.Image] = []
 cached_ui_frame: Image.Image | None = None
 cached_qr_scaled: Image.Image | None = None
 pulse_step = 0
 
+drag_offset_x = 0
+drag_offset_y = 0
+resize_start_x = 0
+resize_start_y = 0
+resize_start_size = WIN_SIZE
+resize_debounce_id = None
 
+
+def sc(val: float) -> int:
+    """Scales any 1020px-based coordinate or size to the current WIN_SIZE."""
+    return max(1, int(round(val * (WIN_SIZE / BASE_DESIGN_SIZE))))
 
 
 # Fun font from googlefonts, I think i can include the font when i build to exe
@@ -115,7 +142,7 @@ LOADED_FONT_PATH = ensure_pixel_font()
 
 def get_pil_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     if LOADED_FONT_PATH and os.path.exists(LOADED_FONT_PATH):
-        return ImageFont.truetype(LOADED_FONT_PATH, size)
+        return ImageFont.truetype(LOADED_FONT_PATH, max(8, size))
     return ImageFont.load_default()
 
 
@@ -125,7 +152,7 @@ def draw_old_english_pixel_panel(img: Image.Image, bounds: tuple[int, int, int, 
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     x1, y1, x2, y2 = bounds
-    p = 3  # Change corner size here
+    p = max(2, sc(3))  # Scales corner pixel size with window
 
     # Adjust transparency here if its too hard to see funny man
     draw.rectangle((x1 + p * 2, y1 + p * 2, x2 - p * 2, y2 - p * 2), fill=PALETTE_PANEL_RGBA)
@@ -184,7 +211,7 @@ def make_pixel_button_image(text: str, width: int, height: int, bg_rgb: tuple[in
     img = Image.new("RGBA", (width, height), bg_rgb + (255,))
     draw = ImageDraw.Draw(img)
     draw.fontmode = "1"
-    p = 2
+    p = max(1, sc(2))
 
     draw.rectangle((0, 0, width - 1, p - 1), fill=PALETTE_GOLD + (255,))
     draw.rectangle((0, height - p, width - 1, height - 1), fill=PALETTE_GOLD + (255,))
@@ -194,27 +221,24 @@ def make_pixel_button_image(text: str, width: int, height: int, bg_rgb: tuple[in
     for cx, cy in [(p, p), (width - p * 2, p), (p, height - p * 2), (width - p * 2, height - p * 2)]:
         draw.rectangle((cx, cy, cx + p - 1, cy + p - 1), fill=PALETTE_GOLD + (255,))
 
-    font = get_pil_font(20)
+    font = get_pil_font(sc(20))
     bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     tx = (width - tw) // 2
     ty = (height - th) // 2 - bbox[1]
 
-    draw.text((tx + 2, ty + 2), text, font=font, fill=PALETTE_DARK + (255,))
+    draw.text((tx + max(1, sc(2)), ty + max(1, sc(2))), text, font=font, fill=PALETTE_DARK + (255,))
     draw.text((tx, ty), text, font=font, fill=PALETTE_GOLD + (255,))
     return ImageTk.PhotoImage(img)
 
 
 # Pulsing effect for qr code when pondering
-GLOW_PATCH_SIZE = ORB_QR_SIZE + 120  
-
-
 def build_pulse_frames(num_frames: int = 24) -> list[Image.Image]:
     # prerender the frames to save compute although i doubt itll matter
     frames = []
     half = GLOW_PATCH_SIZE // 2
     qr_half = ORB_QR_SIZE // 2
-    pixel_step = 5  
+    pixel_step = max(2, sc(5))
 
     for i in range(num_frames):
         t = (math.sin(2 * math.pi * i / num_frames) + 1.0) / 2.0
@@ -222,7 +246,7 @@ def build_pulse_frames(num_frames: int = 24) -> list[Image.Image]:
         glow = Image.new("RGBA", (GLOW_PATCH_SIZE, GLOW_PATCH_SIZE), (0, 0, 0, 0))
         draw = ImageDraw.Draw(glow)
 
-        spread = int(14 + 22 * t)
+        spread = int(sc(14) + sc(22) * t)
         outer_alpha = int(75 + 95 * t)
         r = int(PALETTE_GLOW_CYAN[0] * (1 - t * 0.4) + PALETTE_GOLD[0] * (t * 0.4))
         g = int(PALETTE_GLOW_CYAN[1] * (1 - t * 0.4) + PALETTE_GOLD[1] * (t * 0.4))
@@ -235,11 +259,11 @@ def build_pulse_frames(num_frames: int = 24) -> list[Image.Image]:
                 half + qr_half + spread,
                 half + qr_half + spread,
             ),
-            radius=28,
+            radius=sc(28),
             fill=(r, g, b, outer_alpha),
         )
 
-        rim_spread = int(5 + 8 * t)
+        rim_spread = int(sc(5) + sc(8) * t)
         rim_alpha = int(130 + 90 * t)
         draw.rounded_rectangle(
             (
@@ -248,15 +272,16 @@ def build_pulse_frames(num_frames: int = 24) -> list[Image.Image]:
                 half + qr_half + rim_spread,
                 half + qr_half + rim_spread,
             ),
-            radius=14,
+            radius=sc(14),
             outline=PALETTE_GOLD + (rim_alpha,),
-            width=6,
+            width=max(2, sc(6)),
         )
 
         # blur effect
-        glow = glow.filter(ImageFilter.GaussianBlur(radius=10 + 6 * t))
+        blur_rad = max(2.0, (10 + 6 * t) * (WIN_SIZE / BASE_DESIGN_SIZE))
+        glow = glow.filter(ImageFilter.GaussianBlur(radius=blur_rad))
         small = glow.resize(
-            (GLOW_PATCH_SIZE // pixel_step, GLOW_PATCH_SIZE // pixel_step),
+            (max(1, GLOW_PATCH_SIZE // pixel_step), max(1, GLOW_PATCH_SIZE // pixel_step)),
             Image.Resampling.BILINEAR,
         )
         pixelated_glow = small.resize((GLOW_PATCH_SIZE, GLOW_PATCH_SIZE), Image.Resampling.NEAREST)
@@ -265,13 +290,9 @@ def build_pulse_frames(num_frames: int = 24) -> list[Image.Image]:
     return frames
 
 
-PULSE_FRAMES = build_pulse_frames()
-
-
 # -------------------
 # QR STUFF
 # -------------------
-# TODO: Fix so the big squares also adjust to the theme
 def generate_qr_image(url: str, show_warning: bool = True) -> Image.Image | None:
     if not url:
         if show_warning:
@@ -314,67 +335,82 @@ def generate_qr_image(url: str, show_warning: bool = True) -> Image.Image | None
     return final_img
 
 
-# pulse loop
-def load_base_wizard() -> Image.Image:
+# Load master wizard image once so resizing doesn't re-read disk
+def load_master_wizard() -> Image.Image:
     if os.path.exists(WIZ_PATH):
         img = Image.open(WIZ_PATH).convert("RGBA")
-        alpha_mask = img.getchannel("A").point(lambda p:255 if p > 10 else 0)
+        alpha_mask = img.getchannel("A").point(lambda p: 255 if p > 10 else 0)
         bbox = alpha_mask.getbbox()
         if bbox:
             img = img.crop(bbox)
-        return img.resize((WIN_SIZE, WIN_SIZE), Image.Resampling.NEAREST)
-    return Image.new("RGBA", (WIN_SIZE, WIN_SIZE), PALETTE_DARK + (255,))
+        return img
+    return Image.new("RGBA", (BASE_DESIGN_SIZE, BASE_DESIGN_SIZE), PALETTE_DARK + (255,))
 
 
-BASE_WIZ_IMG = load_base_wizard()
-PANEL_BASE_IMG = draw_old_english_pixel_panel(BASE_WIZ_IMG, PANEL_BOUNDS)
+MASTER_WIZ_IMG = load_master_wizard()
 
 
 def rebuild_caches(*_args):
     global cached_ui_frame, cached_qr_scaled
 
+    if PANEL_BASE_IMG is None:
+        return
+
     frame = PANEL_BASE_IMG.copy()
     draw = ImageDraw.Draw(frame)
     draw.fontmode = "1"
 
-    font_lg = get_pil_font(24)
-    font_md = get_pil_font(21)
-    font_sm = get_pil_font(18)
+    font_lg = get_pil_font(sc(24))
+    font_md = get_pil_font(sc(21))
+    font_sm = get_pil_font(sc(18))
+
+    sh_off = max(1, sc(2))
 
     def draw_pixel_text(x: int, y: int, text: str, font, color=PALETTE_GOLD):
-        draw.text((x + 2, y + 2), text, font=font, fill=PALETTE_DARK + (255,))
+        draw.text((x + sh_off, y + sh_off), text, font=font, fill=PALETTE_DARK + (255,))
         draw.text((x, y), text, font=font, fill=color + (255,))
 
-    # ADD MORE SETTINGS HERE IF NEEDED (i think this is fine for now tho)
-    draw_pixel_text(86, 34, "Enter Desired URL:", font_lg)
-    draw_pixel_text(86, 114, "QR Style:", font_md)
-    draw_pixel_text(86, 158, "QR Color:", font_md)
+    # ADD MORE SETTINGS HERE IF NEEDED (scaled proportionally to WIN_SIZE)
+    draw_pixel_text(sc(86), sc(34), "Enter Desired URL:", font_lg)
+    draw_pixel_text(sc(86), sc(114), "QR Style:", font_md)
+    draw_pixel_text(sc(86), sc(158), "QR Color:", font_md)
 
     # checkbox
-    cb_x, cb_y, cb_size = 86, 206, 20
+    cb_x, cb_y, cb_size = sc(86), sc(206), sc(20)
     draw.rectangle(
         (cb_x, cb_y, cb_x + cb_size, cb_y + cb_size),
         fill=PALETTE_DARK + (255,),
         outline=PALETTE_GOLD + (255,),
-        width=2,
+        width=max(1, sc(2)),
     )
     if use_bg_var.get():
+        pad = max(2, sc(5))
         draw.rectangle(
-            (cb_x + 5, cb_y + 5, cb_x + cb_size - 5, cb_y + cb_size - 5),
+            (cb_x + pad, cb_y + pad, cb_x + cb_size - pad, cb_y + cb_size - pad),
             fill=PALETTE_GOLD + (255,),
         )
-    draw_pixel_text(cb_x + 30, 202, "Enable BG Color", font_md)
+    draw_pixel_text(cb_x + sc(30), sc(202), "Enable BG Color", font_md)
 
-    # color swatches, id like for them to be selectable, but this works for now
+    # color swatches
     fg_rgb = ImageColor.getrgb(qr_color)
     bg_rgb = ImageColor.getrgb(bg_color)
-    draw.rectangle((708, 160, 736, 184), fill=fg_rgb + (255,), outline=PALETTE_GOLD + (255,), width=2)
-    draw.rectangle((708, 204, 736, 228), fill=bg_rgb + (255,), outline=PALETTE_GOLD + (255,), width=2)
+    draw.rectangle(
+        (sc(708), sc(160), sc(736), sc(184)),
+        fill=fg_rgb + (255,),
+        outline=PALETTE_GOLD + (255,),
+        width=max(1, sc(2)),
+    )
+    draw.rectangle(
+        (sc(708), sc(204), sc(736), sc(228)),
+        fill=bg_rgb + (255,),
+        outline=PALETTE_GOLD + (255,),
+        width=max(1, sc(2)),
+    )
 
     if status_message:
         bbox = draw.textbbox((0, 0), status_message, font=font_sm)
         sw = bbox[2] - bbox[0]
-        draw_pixel_text((WIN_SIZE - sw) // 2, 298, status_message, font_sm, status_color)
+        draw_pixel_text((WIN_SIZE - sw) // 2, sc(298), status_message, font_sm, status_color)
 
     cached_ui_frame = frame
 
@@ -403,7 +439,7 @@ def draw_current_frame():
 
     frame = cached_ui_frame.copy()
 
-    if cached_qr_scaled is not None:
+    if cached_qr_scaled is not None and PULSE_FRAMES:
         # 1. Composite the pulsing arcane aura around the QR code
         glow_img = PULSE_FRAMES[pulse_step % len(PULSE_FRAMES)]
         glow_x = ORB_CENTER_X - (GLOW_PATCH_SIZE // 2)
@@ -423,7 +459,7 @@ def draw_current_frame():
 def animate_pulse():
     """Advances the pulsing light animation around the QR code."""
     global pulse_step
-    if cached_qr_scaled is not None:
+    if cached_qr_scaled is not None and PULSE_FRAMES:
         pulse_step = (pulse_step + 1) % len(PULSE_FRAMES)
         draw_current_frame()
     root.after(45, animate_pulse)
@@ -455,7 +491,7 @@ def choose_bg_color():
 
 
 def on_canvas_click(event):
-    if 86 <= event.x <= 310 and 202 <= event.y <= 230:
+    if sc(86) <= event.x <= sc(310) and sc(202) <= event.y <= sc(230):
         use_bg_var.set(not use_bg_var.get())
         bg_color_btn.config(state="normal" if use_bg_var.get() else "disabled")
         rebuild_caches()
@@ -478,6 +514,7 @@ def save_qr():
     if file_path:
         pil_img.save(file_path, format="PNG")
         set_status(f"Saved to: {os.path.basename(file_path)}", PALETTE_SAGE)
+
 
 # Genuinely why is copying to clipboard so complicated, genuinely not even sure how this works
 # multiple os support in case i put this on github or somn, but windows is probably all ill use it for
@@ -564,7 +601,7 @@ def copy_qr_to_clipboard():
         messagebox.showerror("Clipboard Error", f"Could not copy to clipboard:\n{e}")
 
 
-# COMPLICATED REMOVE WINDOWS BORDER STUFF 
+# COMPLICATED REMOVE WINDOWS BORDER STUFF
 def setup_borderless_with_taskbar():
     system = platform.system()
 
@@ -601,7 +638,6 @@ def setup_borderless_with_taskbar():
         root.overrideredirect(True)
 
 
-
 def minimize_window():
     system = platform.system()
     if system == "Windows":
@@ -617,167 +653,6 @@ def on_window_restore(_event):
     if platform.system() != "Windows":
         if root.state() == "normal" and not root.overrideredirect():
             setup_borderless_with_taskbar()
-
-# Actual app border stuff, i should probably remove the [] max screen button
-APP_TITLE = "Orb QR Pondering"
-TITLE_BAR_HEIGHT = 40
-
-PURPLE_FRAME_BG = "#2e164d"
-PURPLE_TITLE_BG = "#3d1e66"
-PURPLE_TITLE_RIGHT = "#220e3b"
-PURPLE_HILIGHT = "#7a52aa"
-PURPLE_LIGHT = "#53307e"
-PURPLE_SHADOW = "#180929"
-PURPLE_DARK_EDGE = "#0c0417"
-
-
-drag_offset_x = 0
-drag_offset_y = 0
-
-
-# ---------------
-# GUI STUFF
-# ---------------
-# root = tk.Tk()
-# root.title("Orb QR Pondering")
-# root.geometry(f"{WIN_SIZE}x{WIN_SIZE}")
-# root.resizable(False, False)
-
-root = tk.Tk()
-root.title(APP_TITLE)
-root.configure(bg=PURPLE_DARK_EDGE)
-root.bind("<Map>", on_window_restore)
-
-if os.path.exists(ICON_PATH):
-    try:
-        if platform.system() == "Windows":
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("orb.qr.pondering.1")
-            root.iconbitmap(ICON_PATH)
-        pil_ico = Image.open(ICON_PATH)
-        tk_app_icon = ImageTk.PhotoImage(pil_ico)
-        root.iconphoto(True, tk_app_icon)
-    except Exception:
-        pass
-
-# Enable borderless mode while keeping the taskbar icon active
-setup_borderless_with_taskbar()
-
-
-
-ttk_style = ttk.Style()
-ttk_style.theme_use("clam")
-ttk_style.configure(
-    "Orb.TCombobox",
-    fieldbackground=HEX_DARK,
-    background=HEX_TEAL,
-    foreground=HEX_GOLD,
-    arrowcolor=HEX_GOLD,
-    bordercolor=HEX_GOLD,
-    lightcolor=HEX_GOLD,
-    darkcolor=HEX_DARK,
-)
-ttk_style.map(
-    "Orb.TCombobox",
-    fieldbackground=[("readonly", HEX_DARK)],
-    selectbackground=[("readonly", HEX_TEAL)],
-    selectforeground=[("readonly", HEX_GOLD)],
-    foreground=[("readonly", HEX_GOLD)],
-)
-root.option_add("*TCombobox*Listbox.background", HEX_DARK)
-root.option_add("*TCombobox*Listbox.foreground", HEX_GOLD)
-root.option_add("*TCombobox*Listbox.selectBackground", HEX_TEAL)
-root.option_add("*TCombobox*Listbox.selectForeground", HEX_GOLD)
-root.option_add("*TCombobox*Listbox.font", ("Jacquarda Bastarda 9", 14))
-
-canvas = tk.Canvas(root, width=WIN_SIZE, height=WIN_SIZE, highlightthickness=0, bd=0)
-canvas.pack(fill="both", expand=True)
-bg_image_id = canvas.create_image(0, 0, anchor="nw")
-canvas.bind("<Button-1>", on_canvas_click)
-
-url_entry = tk.Entry(
-    root,
-    bg=HEX_DARK,
-    fg=HEX_GOLD,
-    insertbackground=HEX_GOLD,
-    relief="flat",
-    highlightthickness=2,
-    highlightbackground=HEX_GOLD,
-    highlightcolor=HEX_GOLD,
-    font=("Jacquarda Bastarda 9", 15),
-)
-url_entry.bind("<KeyRelease>", rebuild_caches)
-canvas.create_window(86, 68, window=url_entry, anchor="nw", width=848, height=32)
-url_entry.focus()
-
-# makes dropdowns look fun and not stand out so much
-style_var = tk.StringVar(value="Square (Default)")
-style_dropdown = ttk.Combobox(
-    root,
-    textvariable=style_var,
-    values=list(STYLE_MAP.keys()),
-    state="readonly",
-    style="Orb.TCombobox",
-    font=("Jacquarda Bastarda 9", 14),
-)
-style_dropdown.bind("<<ComboboxSelected>>", rebuild_caches)
-canvas.create_window(604, 114, window=style_dropdown, anchor="nw", width=330, height=28)
-
-# Color picker, would love for it to match theme too but im lazy
-use_bg_var = tk.BooleanVar(value=False)
-
-pick_qr_img = make_pixel_button_image("Pick Color", 186, 28, PALETTE_TEAL_MID)
-qr_color_btn = tk.Button(
-    root,
-    image=pick_qr_img,
-    command=choose_qr_color,
-    bd=0,
-    highlightthickness=0,
-    activebackground=HEX_DARK,
-    cursor="hand2",
-)
-canvas.create_window(748, 158, window=qr_color_btn, anchor="nw")
-
-pick_bg_img = make_pixel_button_image("Pick BG", 186, 28, PALETTE_TEAL_MID)
-bg_color_btn = tk.Button(
-    root,
-    image=pick_bg_img,
-    command=choose_bg_color,
-    bd=0,
-    highlightthickness=0,
-    activebackground=HEX_DARK,
-    state="disabled",
-    cursor="hand2",
-)
-canvas.create_window(748, 202, window=bg_color_btn, anchor="nw")
-
-# What to do with qr, save or copy
-save_btn_img = make_pixel_button_image("Save to File...", 410, 36, PALETTE_TEAL_MID)
-save_btn = tk.Button(
-    root,
-    image=save_btn_img,
-    command=save_qr,
-    bd=0,
-    highlightthickness=0,
-    activebackground=HEX_DARK,
-    cursor="hand2",
-)
-canvas.create_window(86, 252, window=save_btn, anchor="nw")
-
-copy_btn_img = make_pixel_button_image("Copy to Clipboard", 410, 36, PALETTE_DARK)
-copy_btn = tk.Button(
-    root,
-    image=copy_btn_img,
-    command=copy_qr_to_clipboard,
-    bd=0,
-    highlightthickness=0,
-    activebackground=HEX_TEAL,
-    cursor="hand2",
-)
-canvas.create_window(524, 252, window=copy_btn, anchor="nw")
-
-
-
-
 
 
 def make_win95_control_button(kind: str, size: int = 28) -> ImageTk.PhotoImage:
@@ -859,10 +734,99 @@ def do_window_drag(event):
     root.geometry(f"+{event.x_root - drag_offset_x}+{event.y_root - drag_offset_y}")
 
 
+# --- Square-Locked Resizing Logic ---
+def apply_window_size():
+    """Scales the square canvas, wizard art, orb position, and all UI widgets proportionally."""
+    global PANEL_BOUNDS, ORB_CENTER_X, ORB_CENTER_Y, ORB_QR_SIZE, GLOW_PATCH_SIZE, PANEL_BASE_IMG, PULSE_FRAMES
+
+    PANEL_BOUNDS = (sc(54), sc(18), sc(966), sc(334))
+    ORB_CENTER_X = int(WIN_SIZE * 0.488)
+    ORB_CENTER_Y = int(WIN_SIZE * 0.812)
+    ORB_QR_SIZE = sc(290)
+    GLOW_PATCH_SIZE = ORB_QR_SIZE + sc(120)
+
+    # 1. Update total window & canvas size
+    root.geometry(f"{WIN_SIZE + 20}x{WIN_SIZE + TITLE_BAR_HEIGHT + 24}")
+    canvas.config(width=WIN_SIZE, height=WIN_SIZE)
+
+    # 2. Update titlebar banner width
+    banner_img = make_titlebar_banner(WIN_SIZE + 8, TITLE_BAR_HEIGHT - 4)
+    title_banner_label.config(image=banner_img)
+    title_banner_label.image = banner_img
+
+    # 3. Rebuild wizard background & pulse frames for new size
+    wiz_resized = MASTER_WIZ_IMG.resize((WIN_SIZE, WIN_SIZE), Image.Resampling.NEAREST)
+    PANEL_BASE_IMG = draw_old_english_pixel_panel(wiz_resized, PANEL_BOUNDS)
+    PULSE_FRAMES = build_pulse_frames()
+
+    # 4. Reposition and scale all UI widgets proportionally
+    url_entry.config(font=("Jacquarda Bastarda 9", max(9, sc(15))))
+    canvas.coords(entry_win, sc(86), sc(68))
+    canvas.itemconfig(entry_win, width=sc(848), height=sc(32))
+
+    style_dropdown.config(font=("Jacquarda Bastarda 9", max(9, sc(14))))
+    canvas.coords(combo_win, sc(604), sc(114))
+    canvas.itemconfig(combo_win, width=sc(330), height=sc(28))
+
+    pick_qr_img = make_pixel_button_image("Pick Color", sc(186), sc(28), PALETTE_TEAL_MID)
+    qr_color_btn.config(image=pick_qr_img)
+    qr_color_btn.image = pick_qr_img
+    canvas.coords(qr_btn_win, sc(748), sc(158))
+
+    pick_bg_img = make_pixel_button_image("Pick BG", sc(186), sc(28), PALETTE_TEAL_MID)
+    bg_color_btn.config(image=pick_bg_img)
+    bg_color_btn.image = pick_bg_img
+    canvas.coords(bg_btn_win, sc(748), sc(202))
+
+    save_btn_img = make_pixel_button_image("Save to File...", sc(410), sc(36), PALETTE_TEAL_MID)
+    save_btn.config(image=save_btn_img)
+    save_btn.image = save_btn_img
+    canvas.coords(save_btn_win, sc(86), sc(252))
+
+    copy_btn_img = make_pixel_button_image("Copy to Clipboard", sc(410), sc(36), PALETTE_DARK)
+    copy_btn.config(image=copy_btn_img)
+    copy_btn.image = copy_btn_img
+    canvas.coords(copy_btn_win, sc(524), sc(252))
+
+    rebuild_caches()
 
 
+def start_window_resize(event):
+    global resize_start_x, resize_start_y, resize_start_size
+    resize_start_x = event.x_root
+    resize_start_y = event.y_root
+    resize_start_size = WIN_SIZE
 
-root.geometry(f"{WIN_SIZE + 20}x{WIN_SIZE + TITLE_BAR_HEIGHT + 24}")
+
+def do_window_resize(event):
+    """Forces 1:1 square aspect ratio while dragging to resize."""
+    global WIN_SIZE, resize_debounce_id
+    dx = event.x_root - resize_start_x
+    dy = event.y_root - resize_start_y
+
+    # Pick whichever direction the mouse moved further so it stays a square
+    delta = dx if abs(dx) > abs(dy) else dy
+    max_screen_fit = root.winfo_screenheight() - TITLE_BAR_HEIGHT - 60
+    new_size = max(MIN_WIN_SIZE, min(MAX_WIN_SIZE, max_screen_fit, resize_start_size + delta))
+
+    if new_size != WIN_SIZE:
+        WIN_SIZE = new_size
+        root.geometry(f"{WIN_SIZE + 20}x{WIN_SIZE + TITLE_BAR_HEIGHT + 24}")
+        if resize_debounce_id is not None:
+            root.after_cancel(resize_debounce_id)
+        resize_debounce_id = root.after(35, apply_window_size)
+
+
+# ---------------
+# GUI STUFF
+# ---------------
+root = tk.Tk()
+root.title(APP_TITLE)
+
+# Calculate initial window size to be half of the user's screen height
+screen_h = root.winfo_screenheight()
+WIN_SIZE = max(MIN_WIN_SIZE, (screen_h // 2) - TITLE_BAR_HEIGHT - 24)
+
 root.configure(
     bg=PURPLE_FRAME_BG,
     bd=4,
@@ -871,14 +835,54 @@ root.configure(
     highlightbackground=PURPLE_HILIGHT,
     highlightcolor=PURPLE_HILIGHT,
 )
-root.bind("<Map>", on_window_restore)
 
+root.bind("\x3cMap\x3e", on_window_restore)
+
+if os.path.exists(ICON_PATH):
+    try:
+        if platform.system() == "Windows":
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("orb.qr.pondering.1")
+            root.iconbitmap(ICON_PATH)
+        pil_ico = Image.open(ICON_PATH)
+        tk_app_icon = ImageTk.PhotoImage(pil_ico)
+        root.iconphoto(True, tk_app_icon)
+    except Exception:
+        pass
+
+# Enable borderless mode while keeping the taskbar icon active
+setup_borderless_with_taskbar()
+
+ttk_style = ttk.Style()
+ttk_style.theme_use("clam")
+ttk_style.configure(
+    "Orb.TCombobox",
+    fieldbackground=HEX_DARK,
+    background=HEX_TEAL,
+    foreground=HEX_GOLD,
+    arrowcolor=HEX_GOLD,
+    bordercolor=HEX_GOLD,
+    lightcolor=HEX_GOLD,
+    darkcolor=HEX_DARK,
+)
+ttk_style.map(
+    "Orb.TCombobox",
+    fieldbackground=[("readonly", HEX_DARK)],
+    selectbackground=[("readonly", HEX_TEAL)],
+    selectforeground=[("readonly", HEX_GOLD)],
+    foreground=[("readonly", HEX_GOLD)],
+)
+root.option_add("*TCombobox*Listbox.background", HEX_DARK)
+root.option_add("*TCombobox*Listbox.foreground", HEX_GOLD)
+root.option_add("*TCombobox*Listbox.selectBackground", HEX_TEAL)
+root.option_add("*TCombobox*Listbox.selectForeground", HEX_GOLD)
+root.option_add("*TCombobox*Listbox.font", ("Jacquarda Bastarda 9", 14))
+
+# Title bar
 title_bar = tk.Frame(root, bg=PURPLE_FRAME_BG, height=TITLE_BAR_HEIGHT)
-title_bar.pack(side="top", fill="x", padx=2, pady=(2, 2), before=canvas)
+title_bar.pack(side="top", fill="x", padx=2, pady=(2, 2))
 title_bar.pack_propagate(False)
 
-banner_img = make_titlebar_banner(WIN_SIZE + 8, TITLE_BAR_HEIGHT - 4)
-title_banner_label = tk.Label(title_bar, image=banner_img, bg=PURPLE_TITLE_BG, bd=0, highlightthickness=0)
+title_banner_label = tk.Label(title_bar, bg=PURPLE_TITLE_BG, bd=0, highlightthickness=0)
 title_banner_label.pack(fill="both", expand=True)
 title_banner_label.bind("<ButtonPress-1>", start_window_drag)
 title_banner_label.bind("<B1-Motion>", do_window_drag)
@@ -887,7 +891,6 @@ controls_frame = tk.Frame(title_banner_label, bg=PURPLE_TITLE_RIGHT)
 controls_frame.place(relx=1.0, rely=0.5, x=-6, anchor="e")
 
 min_icon = make_win95_control_button("min")
-# size_icon = make_win95_control_button("size")
 close_icon = make_win95_control_button("close")
 
 tk.Button(
@@ -895,42 +898,121 @@ tk.Button(
     bd=0, highlightthickness=0, bg=PURPLE_FRAME_BG, activebackground=PURPLE_LIGHT, cursor="hand2"
 ).pack(side="left", padx=2)
 
-# THIS IS FOR MAX SCREEN
-# I dont plan on adding this anymore, kinda like it being a small little app
-# tk.Button(
-#     controls_frame, image=size_icon,
-#     bd=0, highlightthickness=0, bg=PURPLE_FRAME_BG, activebackground=PURPLE_LIGHT, cursor="hand2"
-# ).pack(side="left", padx=2)
-
 tk.Button(
     controls_frame, image=close_icon, command=root.destroy,
     bd=0, highlightthickness=0, bg=PURPLE_FRAME_BG, activebackground="#8b1e3f", cursor="hand2"
 ).pack(side="left", padx=(2, 0))
 
-# retro windows 3d effect
-canvas.config(
+# Main Wizard Canvas with retro 3D sunken effect
+canvas = tk.Canvas(
+    root,
+    width=WIN_SIZE,
+    height=WIN_SIZE,
     bd=3,
     relief="sunken",
     highlightthickness=1,
     highlightbackground=PURPLE_DARK_EDGE,
     highlightcolor=PURPLE_DARK_EDGE,
 )
-canvas.pack_configure(padx=2, pady=(0, 2))
+canvas.pack(fill="both", expand=True, padx=2, pady=(0, 2))
+bg_image_id = canvas.create_image(0, 0, anchor="nw")
+canvas.bind("<Button-1>", on_canvas_click)
 
-# ico stuff
-if os.path.exists(ICON_PATH):
-    try:
-        if platform.system() == "Windows":
-            root.iconbitmap(ICON_PATH)
-        pil_ico = Image.open(ICON_PATH)
-        tk_app_icon = ImageTk.PhotoImage(pil_ico)
-        root.iconphoto(True, tk_app_icon)
-    except Exception:
-        pass
+# UI Elements on Canvas (stored by ID so apply_window_size can scale them)
+url_entry = tk.Entry(
+    root,
+    bg=HEX_DARK,
+    fg=HEX_GOLD,
+    insertbackground=HEX_GOLD,
+    relief="flat",
+    highlightthickness=2,
+    highlightbackground=HEX_GOLD,
+    highlightcolor=HEX_GOLD,
+    font=("Jacquarda Bastarda 9", 15),
+)
+url_entry.bind("<KeyRelease>", rebuild_caches)
+entry_win = canvas.create_window(sc(86), sc(68), window=url_entry, anchor="nw", width=sc(848), height=sc(32))
+url_entry.focus()
 
+style_var = tk.StringVar(value="Square (Default)")
+style_dropdown = ttk.Combobox(
+    root,
+    textvariable=style_var,
+    values=list(STYLE_MAP.keys()),
+    state="readonly",
+    style="Orb.TCombobox",
+    font=("Jacquarda Bastarda 9", 14),
+)
+style_dropdown.bind("<<ComboboxSelected>>", rebuild_caches)
+combo_win = canvas.create_window(sc(604), sc(114), window=style_dropdown, anchor="nw", width=sc(330), height=sc(28))
 
+use_bg_var = tk.BooleanVar(value=False)
 
-# yipee
-rebuild_caches()
+qr_color_btn = tk.Button(
+    root,
+    command=choose_qr_color,
+    bd=0,
+    highlightthickness=0,
+    activebackground=HEX_DARK,
+    cursor="hand2",
+)
+qr_btn_win = canvas.create_window(sc(748), sc(158), window=qr_color_btn, anchor="nw")
+
+bg_color_btn = tk.Button(
+    root,
+    command=choose_bg_color,
+    bd=0,
+    highlightthickness=0,
+    activebackground=HEX_DARK,
+    state="disabled",
+    cursor="hand2",
+)
+bg_btn_win = canvas.create_window(sc(748), sc(202), window=bg_color_btn, anchor="nw")
+
+save_btn = tk.Button(
+    root,
+    command=save_qr,
+    bd=0,
+    highlightthickness=0,
+    activebackground=HEX_DARK,
+    cursor="hand2",
+)
+save_btn_win = canvas.create_window(sc(86), sc(252), window=save_btn, anchor="nw")
+
+copy_btn = tk.Button(
+    root,
+    command=copy_qr_to_clipboard,
+    bd=0,
+    highlightthickness=0,
+    activebackground=HEX_TEAL,
+    cursor="hand2",
+)
+copy_btn_win = canvas.create_window(sc(524), sc(252), window=copy_btn, anchor="nw")
+
+# Classic Win95 Bottom-Right Corner Resize Grip (Drag to resize while keeping square aspect ratio)
+resize_grip = tk.Canvas(
+    root,
+    width=16,
+    height=16,
+    bg=PURPLE_FRAME_BG,
+    bd=0,
+    highlightthickness=0,
+    cursor="sizing",
+)
+for offset in (4, 8, 12):
+    resize_grip.create_line(offset, 15, 15, offset, fill=PURPLE_HILIGHT, width=1)
+    resize_grip.create_line(offset + 1, 15, 15, offset + 1, fill=PURPLE_SHADOW, width=1)
+resize_grip.place(relx=1.0, rely=1.0, anchor="se", x=-2, y=-2)
+resize_grip.bind("<ButtonPress-1>", start_window_resize)
+resize_grip.bind("<B1-Motion>", do_window_resize)
+
+# Center the window on the user's screen on first launch, apply scaling, and start animation
+apply_window_size()
+total_w = WIN_SIZE + 20
+total_h = WIN_SIZE + TITLE_BAR_HEIGHT + 24
+start_x = (root.winfo_screenwidth() - total_w) // 2
+start_y = (screen_h - total_h) // 2
+root.geometry(f"{total_w}x{total_h}+{start_x}+{start_y}")
+
 animate_pulse()
 root.mainloop()
